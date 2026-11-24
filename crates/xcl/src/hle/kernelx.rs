@@ -1020,30 +1020,81 @@ fn committed_page(a: usize) -> bool {
     unsafe { mem::VirtualQuery(a as *const c_void, &mut m, std::mem::size_of_val(&m)) != 0 && m.State == mem::MEM_COMMIT }
 }
 
+/// The system can commit 4 KiB spans without calling the lazy fault handler.
+unsafe fn snapshot_lazy_mapping(at: usize) -> Result<Option<Vec<u8>>, ()> {
+    let end = at + PHYS_PAGE;
+    let mut address = at;
+    let mut snapshot = None;
+    while address < end {
+        let mut info: mem::MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+        if mem::VirtualQuery(address as *const c_void, &mut info, std::mem::size_of_val(&info)) == 0 {
+            return Err(());
+        }
+        let next = (info.BaseAddress as usize).checked_add(info.RegionSize).ok_or(())?.min(end);
+        if next <= address {
+            return Err(());
+        }
+        if info.State == mem::MEM_COMMIT {
+            if info.Protect & (mem::PAGE_GUARD | mem::PAGE_NOACCESS) != 0 {
+                return Err(());
+            }
+            let bytes = snapshot.get_or_insert_with(|| vec![0; PHYS_PAGE]);
+            let dst = &mut bytes[address - at..next - at];
+            let mut read = 0;
+            if windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory(
+                thr::GetCurrentProcess(), address as *const c_void, dst.as_mut_ptr().cast(), dst.len(), &mut read,
+            ) == 0 || read != dst.len() {
+                return Err(());
+            }
+        }
+        address = next;
+    }
+    Ok(snapshot)
+}
+
 /// Copy what is mapped at `at` back home and unmap it (Windows memory is decommitted); the homes
 /// in `committed` the caller has committed.
-unsafe fn unmap_away(away: &mut Away, at: usize, committed: &std::ops::Range<usize>) {
-    if let Some(page) = away.at.remove(&at) {
-        away.page.remove(&page);
-        // never used where it was mapped: its home still holds the page (zeros)
-        if lazy::unmark(at) {
-            return;
+unsafe fn unmap_away(away: &mut Away, at: usize, committed: &std::ops::Range<usize>) -> bool {
+    let Some(&page) = away.at.get(&at) else { return true };
+    let lazy = lazy::uncommitted(at);
+    let snapshot = if lazy {
+        match snapshot_lazy_mapping(at) {
+            Ok(bytes) => bytes,
+            Err(()) => {
+                fnd::SetLastError(fnd::ERROR_NOACCESS);
+                return false;
+            }
         }
-        // (a home this call has not given back yet is still committed)
+    } else {
+        None
+    };
+
+    if !lazy || snapshot.is_some() {
+        // A home this call has not given back yet is still committed.
         let own = page_home(page);
-        let pending = away.gone.len();
-        away.gone.retain(|&h| Some(h) != own);
-        let home = if away.gone.len() < pending || own.is_some_and(|h| committed.contains(&h)) { own } else { own.and_then(|h| home_again(h)) };
-        if let Some(home) = home {
-            std::ptr::copy_nonoverlapping(at as *const u8, home as *mut u8, PHYS_PAGE);
-            #[cfg(test)]
-            tests::HOME_COPIES.with(|c| c.set(c.get() + 1));
-        }
-        // (an address among the homes the caller maps back is one of them: it stays)
+        let home = if own.is_some_and(|h| away.gone.contains(&h) || committed.contains(&h)) {
+            own
+        } else {
+            own.and_then(|h| home_again(h))
+        };
+        let Some(home) = home else {
+            fnd::SetLastError(fnd::ERROR_NOT_ENOUGH_MEMORY);
+            return false;
+        };
+        away.gone.retain(|&h| h != home);
+        let source = snapshot.as_ref().map_or(at as *const u8, |bytes| bytes.as_ptr());
+        std::ptr::copy_nonoverlapping(source, home as *mut u8, PHYS_PAGE);
+        #[cfg(test)]
+        tests::HOME_COPIES.with(|c| c.set(c.get() + 1));
         if !committed.contains(&at) {
             release_at(at);
         }
     }
+
+    away.at.remove(&at);
+    away.page.remove(&page);
+    lazy::unmark(at);
+    true
 }
 
 /// The memory at `at`, which a page mapped away from home left, decommitted (UMA memory that is
@@ -1197,7 +1248,9 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
         away.gone.retain(|&h| h < home || h >= home + n * PHYS_PAGE);
         for &p in &pages {
             if let Some(&at) = away.page.get(&p) {
-                unmap_away(away, at, &(home..home + n * PHYS_PAGE));
+                if !unmap_away(away, at, &(home..home + n * PHYS_PAGE)) {
+                    return std::ptr::null_mut();
+                }
             }
         }
         return home as *mut c_void;
@@ -1210,7 +1263,9 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
     let in_uma = |a: usize| crate::gpu::uma::get().is_some_and(|u| u.is_committed(a));
     for (i, &p) in pages.iter().enumerate() {
         let at = base + i * PHYS_PAGE;
-        unmap_away(away, at, &(0..0));
+        if !unmap_away(away, at, &(0..0)) {
+            return std::ptr::null_mut();
+        }
         if p == 0 {
             continue;
         }
@@ -2096,6 +2151,85 @@ mod tests {
             assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 2, pages.as_mut_ptr()), 1);
             mem::VirtualFree(r as *mut c_void, 0, mem::MEM_RELEASE);
             mem::VirtualFree(r0 as *mut c_void, 0, mem::MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn scatter_unmap_preserves_an_explicitly_committed_page() {
+        unsafe {
+            let mut count = 2;
+            let mut pages = [0usize; 2];
+            assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut count, pages.as_mut_ptr()), 1);
+            let home = page_home(pages[0]).unwrap();
+            assert!(!committed_page(home));
+            let base = VirtualAlloc(std::ptr::null(), 2 * PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE);
+            assert!(!base.is_null());
+            let addrs = [base, base.cast::<u8>().add(PHYS_PAGE).cast()];
+            let mut ids = pages.map(|page| page as u64);
+            assert_eq!(XMemMapPhysicalPagesScatter(addrs.as_ptr(), addrs.len(), ids.as_mut_ptr()), 1);
+            assert!(!committed_page(base as usize));
+            assert_eq!(VirtualAlloc(base, PHYS_PAGE, mem::MEM_COMMIT, mem::PAGE_READWRITE), base);
+            base.cast::<u8>().write(0x67);
+            base.cast::<u8>().add(PHYS_PAGE - 1).write(0x89);
+            assert_eq!(XMemMapPhysicalPagesScatter(addrs.as_ptr(), addrs.len(), [0u64; 2].as_mut_ptr()), 1);
+            let returned = !committed_page(base as usize);
+            let unused = !committed_page(home + PHYS_PAGE);
+            let mut out = vec![0; PHYS_PAGE];
+            assert!(read_physical_pages(&pages, 0, &mut out));
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), count, pages.as_mut_ptr()), 1);
+            assert_eq!(VirtualFree(base, 0, mem::MEM_RELEASE), 1);
+            assert_eq!((out[0], out[PHYS_PAGE - 1]), (0x67, 0x89));
+            assert!(returned);
+            assert!(unused);
+        }
+    }
+
+    #[test]
+    fn scatter_unmap_preserves_disjoint_partial_commits() {
+        unsafe {
+            const CHUNK: usize = 0x1000;
+            let mut count = 1;
+            let mut page = 0;
+            assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut count, &mut page), 1);
+            let base = mem::VirtualAlloc(std::ptr::null(), PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE);
+            assert!(!base.is_null());
+            let mut id = page as u64;
+            assert_eq!(XMemMapPhysicalPagesScatter(&base, 1, &mut id), 1);
+
+            let mut expected = vec![0; PHYS_PAGE];
+            for (offset, first, last) in [(CHUNK, 0x34, 0x56), (PHYS_PAGE - CHUNK, 0x78, 0x9a)] {
+                let subpage = base.cast::<u8>().add(offset);
+                assert_eq!(mem::VirtualAlloc(subpage.cast(), CHUNK, mem::MEM_COMMIT, mem::PAGE_READWRITE), subpage.cast());
+                subpage.write(first);
+                subpage.add(CHUNK - 1).write(last);
+                expected[offset] = first;
+                expected[offset + CHUNK - 1] = last;
+                let mut old = 0;
+                assert_ne!(mem::VirtualProtect(subpage.cast(), CHUNK, mem::PAGE_READONLY, &mut old), 0);
+                assert_eq!(old, mem::PAGE_READWRITE);
+            }
+            assert!(!committed_page(base as usize));
+            let last = base.cast::<u8>().add(PHYS_PAGE - CHUNK);
+            let mut previous = 0;
+            assert_ne!(mem::VirtualProtect(last.cast(), CHUNK, mem::PAGE_NOACCESS, &mut previous), 0);
+            assert_eq!(previous, mem::PAGE_READONLY);
+            assert_eq!(XMemMapPhysicalPagesScatter(&base, 1, &mut 0u64), 0);
+            assert_eq!(fnd::GetLastError(), fnd::ERROR_NOACCESS);
+            assert_eq!(AWAY.lock().unwrap().as_ref().unwrap().page.get(&page), Some(&(base as usize)));
+            assert_ne!(mem::VirtualProtect(last.cast(), CHUNK, mem::PAGE_READONLY, &mut previous), 0);
+            assert_eq!(previous, mem::PAGE_NOACCESS);
+            assert_eq!(last.read(), 0x78);
+            assert_eq!(last.add(CHUNK - 1).read(), 0x9a);
+            assert_eq!(XMemMapPhysicalPagesScatter(&base, 1, &mut 0u64), 1);
+
+            let mut data = vec![0xff; PHYS_PAGE];
+            assert!(read_physical_pages(&[page], 0, &mut data));
+            for offset in (0..PHYS_PAGE).step_by(CHUNK) {
+                assert!(!committed_page(base as usize + offset));
+            }
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), count, &mut page), 1);
+            assert_eq!(mem::VirtualFree(base, 0, mem::MEM_RELEASE), 1);
+            assert!(data == expected, "the snapshot must preserve both committed spans and zero the holes");
         }
     }
 

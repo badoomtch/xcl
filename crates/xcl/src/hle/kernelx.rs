@@ -1114,26 +1114,44 @@ unsafe fn release_at(at: usize) {
 /// commits and decommits, each a tile mapping in a sparse window: a retail game moving pages one
 /// at a time after its first movie spent 20 s in them and its watchdog ended it. False: the page
 /// was never used at `old` (its home holds it, zeros) and is not mapped anywhere now.
-unsafe fn move_away(away: &mut Away, old: usize, at: usize, page: usize, in_uma: bool) -> Result<bool, ()> {
-    if lazy::unmark(old) {
-        away.at.remove(&old);
-        away.page.remove(&page);
-        return Ok(false);
+unsafe fn move_away(away: &mut Away, old: usize, at: usize, page: usize, in_uma: bool) -> Result<(), u32> {
+    let lazy = lazy::uncommitted(old);
+    let snapshot = if lazy { snapshot_lazy_mapping(old).map_err(|()| fnd::ERROR_NOACCESS)? } else { None };
+    let zero = lazy && snapshot.is_none();
+    // An untouched zero page can stay lazy if the whole destination lies in a plain reservation.
+    let leave_reserved = zero && crate::gpu::uma::get().is_none_or(|u| !u.contains(at)) && {
+        let mut m: mem::MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+        mem::VirtualQuery(at as *const c_void, &mut m, std::mem::size_of_val(&m)) != 0
+            && m.State == mem::MEM_RESERVE
+            && (m.BaseAddress as usize).saturating_add(m.RegionSize).saturating_sub(at) >= PHYS_PAGE
+    };
+    if leave_reserved {
+        lazy::mark(at);
+    } else {
+        // Leave both original lookups and its lazy marker intact if the destination fails.
+        if !in_uma && mem::VirtualAlloc(at as *const c_void, PHYS_PAGE, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null() {
+            return Err(fnd::ERROR_INVALID_ADDRESS);
+        }
+        if zero {
+            std::ptr::write_bytes(at as *mut u8, 0, PHYS_PAGE);
+        } else {
+            let source = snapshot.as_ref().map_or(old as *const u8, |bytes| bytes.as_ptr());
+            std::ptr::copy_nonoverlapping(source, at as *mut u8, PHYS_PAGE);
+        }
+        if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(at)) {
+            crate::hle::d3d12x::sparse::committed(at, PHYS_PAGE);
+        }
     }
-    // (a destination that cannot be committed leaves the page where it was, mapped as before)
-    if !in_uma && mem::VirtualAlloc(at as *const c_void, PHYS_PAGE, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null() {
-        return Err(());
+    if lazy {
+        lazy::unmark(old);
+    }
+    if !zero {
+        release_at(old);
     }
     away.at.remove(&old);
-    away.page.remove(&page);
-    std::ptr::copy_nonoverlapping(old as *const u8, at as *mut u8, PHYS_PAGE);
-    if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(at)) {
-        crate::hle::d3d12x::sparse::committed(at, PHYS_PAGE);
-    }
-    release_at(old);
     away.at.insert(at, page);
     away.page.insert(page, at);
-    Ok(true)
+    Ok(())
 }
 
 pub unsafe extern "system" fn AllocateTitlePhysicalPages(_p: HANDLE, _t: u32, num: *mut usize, arr: *mut usize) -> BOOL {
@@ -1270,14 +1288,11 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
             continue;
         }
         if let Some(&old) = away.page.get(&p) {
-            match move_away(away, old, at, p, in_uma(at)) {
-                Ok(true) => continue,
-                Ok(false) => {}
-                Err(()) => {
-                    fnd::SetLastError(fnd::ERROR_INVALID_ADDRESS);
-                    return std::ptr::null_mut();
-                }
+            if let Err(error) = move_away(away, old, at, p, in_uma(at)) {
+                fnd::SetLastError(error);
+                return std::ptr::null_mut();
             }
+            continue;
         }
         let fresh = !in_uma(at) && !committed_page(at);
         let home = page_home(p).unwrap();
@@ -2389,6 +2404,67 @@ mod tests {
             assert_eq!(XMemMapPhysicalPagesScatter(&b, 1, zero.as_mut_ptr()), 1);
             assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 1, pages.as_mut_ptr()), 1);
             mem::VirtualFree(r as *mut c_void, 0, mem::MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn direct_move_preserves_partial_commits_and_can_retry() {
+        unsafe {
+            const CHUNK: usize = 4096;
+            let mut count = 1;
+            let mut page = 0;
+            assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut count, &mut page), 1);
+            let base = mem::VirtualAlloc(std::ptr::null(), 2 * PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE);
+            let short = mem::VirtualAlloc(std::ptr::null(), CHUNK, mem::MEM_RESERVE, mem::PAGE_READWRITE);
+            assert!(!base.is_null() && !short.is_null());
+            let dest = base.cast::<u8>().add(PHYS_PAGE).cast();
+            let mut id = page as u64;
+            assert_eq!(XMemMapPhysicalPagesScatter(&base, 1, &mut id), 1);
+            assert!(lazy::uncommitted(base as usize));
+            let check_source = || {
+                let lock = AWAY.lock().unwrap();
+                let away = lock.as_ref().unwrap();
+                assert_eq!(away.page.get(&page), Some(&(base as usize)));
+                assert_eq!(away.at.get(&(base as usize)), Some(&page));
+                assert!(!away.at.contains_key(&(short as usize)) && !away.at.contains_key(&(dest as usize)));
+                assert!(lazy::uncommitted(base as usize));
+            };
+            // Even a wholly untouched page cannot be moved into an undersized reservation.
+            assert_eq!(XMemMapPhysicalPagesScatter(&short, 1, &mut id), 0);
+            assert_eq!(fnd::GetLastError(), fnd::ERROR_INVALID_ADDRESS);
+            check_source();
+            let mut expected = vec![0; PHYS_PAGE];
+            for (offset, value) in [(CHUNK, 0x35), (PHYS_PAGE - CHUNK, 0xa9)] {
+                let span = base.cast::<u8>().add(offset);
+                assert_eq!(mem::VirtualAlloc(span.cast(), CHUNK, mem::MEM_COMMIT, mem::PAGE_READWRITE), span.cast());
+                std::ptr::write_bytes(span, value, CHUNK);
+                expected[offset..offset + CHUNK].fill(value);
+            }
+            let last = base.cast::<u8>().add(PHYS_PAGE - CHUNK);
+            let mut prev = 0;
+            assert_ne!(mem::VirtualProtect(last.cast(), CHUNK, mem::PAGE_NOACCESS, &mut prev), 0);
+            assert_eq!(XMemMapPhysicalPagesScatter(&dest, 1, &mut id), 0);
+            assert_eq!(fnd::GetLastError(), fnd::ERROR_NOACCESS);
+            check_source();
+            assert_ne!(mem::VirtualProtect(last.cast(), CHUNK, mem::PAGE_READONLY, &mut prev), 0);
+            assert_eq!(XMemMapPhysicalPagesScatter(&short, 1, &mut id), 0);
+            assert_eq!(fnd::GetLastError(), fnd::ERROR_INVALID_ADDRESS);
+            check_source();
+            let before = HOME_COPIES.with(|c| c.get());
+            assert_eq!(XMemMapPhysicalPagesScatter(&dest, 1, &mut id), 1);
+            assert_eq!(HOME_COPIES.with(|c| c.get()), before);
+            assert!(!lazy::uncommitted(base as usize));
+            for offset in (0..PHYS_PAGE).step_by(CHUNK) {
+                assert!(!committed_page(base as usize + offset));
+            }
+            assert_eq!(std::slice::from_raw_parts(dest.cast::<u8>(), PHYS_PAGE), expected.as_slice());
+            assert_eq!(XMemMapPhysicalPagesScatter(&dest, 1, &mut 0u64), 1);
+            let mut out = vec![0xff; PHYS_PAGE];
+            assert!(read_physical_pages(&[page], 0, &mut out));
+            assert_eq!(out, expected);
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), count, &mut page), 1);
+            assert_eq!(mem::VirtualFree(short, 0, mem::MEM_RELEASE), 1);
+            assert_eq!(mem::VirtualFree(base, 0, mem::MEM_RELEASE), 1);
         }
     }
 
